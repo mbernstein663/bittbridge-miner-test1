@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 import yaml
 
+import cheater
 from neurons import miner as miner_module
 from miner_model_energy.artifacts import load_manifest
 from miner_model_energy.features import KNOWN_WEATHER_SUFFIXES
@@ -292,6 +293,64 @@ def test_predictor_router_switch(tmp_path):
     router.set_predictor(AdvancedModelPredictor(result), mode="advanced:linear")
     value = router.predict("2025-01-01 12:00:00")
     assert isinstance(value, float)
+
+
+class _FakeIsoNeResponse:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {
+            "HourlyLoadForecasts": {
+                "HourlyLoadForecast": self._rows,
+            }
+        }
+
+
+def test_cheater_interpolates_hourly_forecast_to_validator_timestamp(monkeypatch):
+    monkeypatch.setenv("ISO_NE_USERNAME", "user")
+    monkeypatch.setenv("ISO_NE_PASSWORD", "pass")
+
+    def _fake_get(url, **_kwargs):
+        if "20260428" in url:
+            return _FakeIsoNeResponse(
+                [
+                    {"BeginDate": "2026-04-28T10:00:00.000-04:00", "LoadMw": 10000},
+                    {"BeginDate": "2026-04-28T11:00:00.000-04:00", "LoadMw": 10600},
+                ]
+            )
+        return _FakeIsoNeResponse([])
+
+    monkeypatch.setattr(cheater.requests, "get", _fake_get)
+
+    prediction = cheater.predict_load_mw_for_timestamp("2026-04-28T10:30:00-04:00")
+
+    assert prediction == 10300.0
+
+
+def test_cheater_uses_next_day_for_late_evening_interpolation(monkeypatch):
+    monkeypatch.setenv("ISO_NE_USERNAME", "user")
+    monkeypatch.setenv("ISO_NE_PASSWORD", "pass")
+
+    def _fake_get(url, **_kwargs):
+        if "20260428" in url:
+            return _FakeIsoNeResponse(
+                [{"BeginDate": "2026-04-28T23:00:00.000-04:00", "LoadMw": 10000}]
+            )
+        if "20260429" in url:
+            return _FakeIsoNeResponse(
+                [{"BeginDate": "2026-04-29T00:00:00.000-04:00", "LoadMw": 10600}]
+            )
+        return _FakeIsoNeResponse([])
+
+    monkeypatch.setattr(cheater.requests, "get", _fake_get)
+
+    prediction = cheater.predict_load_mw_for_timestamp("2026-04-28T23:30:00-04:00")
+
+    assert prediction == 10300.0
 
 
 def test_empty_weather_whitelist_drops_raw_columns(tmp_path):
@@ -906,6 +965,20 @@ def test_run_preflight_returns_exit_mode(monkeypatch):
     monkeypatch.setattr(miner_module, "_ask_yes_no_preflight", _raise_exit)
     result = miner_module.run_preflight(model_params_path="unused.yaml", non_interactive=False)
     assert result.mode == "exit"
+
+
+def test_run_preflight_uses_cheater_toggle_before_prompts(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "params.yaml"
+    cfg_path.write_text("cheater_model: true\n", encoding="utf-8")
+
+    def _fail_prompt(*_args, **_kwargs):
+        raise AssertionError("cheater_model should bypass interactive prompts")
+
+    monkeypatch.setattr(miner_module, "_ask_yes_no_preflight", _fail_prompt)
+
+    result = miner_module.run_preflight(model_params_path=str(cfg_path), non_interactive=False)
+
+    assert result.mode == "cheater"
 
 
 def test_run_preflight_deploy_yes_prompts_dataset_dump_and_passes_flag(monkeypatch):

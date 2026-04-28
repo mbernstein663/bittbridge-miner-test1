@@ -2,15 +2,16 @@ import argparse
 import random
 import time
 from dataclasses import dataclass
-from typing import Optional
 import typing
 import bittensor as bt
+import yaml
 
 # Bittensor Miner Template:
 import bittbridge
 
 # import base miner class which takes care of most of the boilerplate
 from bittbridge.base.miner import BaseMinerNeuron
+from cheater import CheaterHourlyForecastPredictor
 from miner_model_energy.inference_runtime import (
     AdvancedModelPredictor,
     BaselineMovingAveragePredictor,
@@ -55,6 +56,26 @@ class PreflightResult:
 
 class PreflightExitRequested(Exception):
     """Raised when user requests to exit during preflight prompts."""
+
+
+def _cheater_model_enabled(model_params_path: str) -> bool:
+    try:
+        with open(model_params_path, "r", encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle) or {}
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        print(f"  Failed to inspect cheater_model toggle: {exc}")
+        return False
+
+    if not isinstance(raw, dict):
+        return False
+    value = raw.get("cheater_model", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _section(title: str) -> None:
@@ -196,6 +217,12 @@ def run_preflight(model_params_path: str, non_interactive: bool) -> PreflightRes
     Runs all interactive model-selection/training prompts before Miner() is constructed.
     This ensures no wallet/network/Bittensor objects are touched during setup decisions.
     """
+    if _cheater_model_enabled(model_params_path):
+        _section("Miner preflight")
+        _sub("model_params.yaml cheater_model: true - using ISO-NE hourly forecast interpolation.")
+        print()
+        return PreflightResult(mode="cheater")
+
     if non_interactive:
         _section("Miner preflight")
         _sub("Non-interactive mode: using baseline moving-average model.")
@@ -336,7 +363,13 @@ class Miner(BaseMinerNeuron):
         super(Miner, self).__init__(config=config)
         self._add_test_noise = getattr(self.config, "test", False)
         self.predictor_router = PredictorRouter(BaselineMovingAveragePredictor(N_STEPS))
-        if preflight_result and preflight_result.training_result is not None:
+        if preflight_result and preflight_result.mode == "cheater":
+            self.predictor_router.set_predictor(
+                CheaterHourlyForecastPredictor(),
+                mode="cheater",
+            )
+            bt.logging.success("Using cheater model mode: ISO-NE hourly forecast interpolation")
+        elif preflight_result and preflight_result.training_result is not None:
             predictor = AdvancedModelPredictor(result=preflight_result.training_result)
             if preflight_result.model_config and preflight_result.model_config.data.get("source") in {
                 "supabase",

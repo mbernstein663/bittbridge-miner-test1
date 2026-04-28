@@ -11,14 +11,14 @@ import requests
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 
-from bittbridge.utils.timestamp import get_now, round_to_interval, to_datetime, to_str
+from bittbridge.utils.timestamp import to_datetime
 
 
 ISO_NE_BASE_URL = "https://webservices.iso-ne.com/api/v1.1"
 
 
 class CheaterForecastError(RuntimeError):
-    """Raised when the ISO-NE hourly forecast cannot produce a target prediction."""
+    """Raised when ISO-NE hourly forecast data cannot produce a target prediction."""
 
 
 def _get_credentials() -> tuple[str, str]:
@@ -62,9 +62,8 @@ def _fetch_forecast_rows_around(target_timestamp: str) -> list[dict[str, Any]]:
     target_day = target_dt.strftime("%Y%m%d")
     rows = _fetch_hourly_load_forecast(target_day)
 
-    # Include the next day's first hourly point so late-evening 5-minute slots can
-    # interpolate between 23:00 and 00:00. If unavailable, the target-day data may
-    # still be sufficient for exact hourly timestamps.
+    # Late-evening 5-minute targets need the following day's 00:00 hourly point
+    # to interpolate after 23:00 without extrapolating.
     next_day = (target_dt + timedelta(days=1)).strftime("%Y%m%d")
     if next_day != target_day:
         try:
@@ -87,22 +86,26 @@ def _interpolate_five_minute_prediction(
 
     frame["BeginDate"] = pd.to_datetime(frame["BeginDate"], utc=True, errors="coerce")
     frame["LoadMw"] = pd.to_numeric(frame["LoadMw"], errors="coerce")
+    if "CreationDate" in frame.columns:
+        frame["CreationDate"] = pd.to_datetime(frame["CreationDate"], utc=True, errors="coerce")
+        frame = frame.sort_values(
+            ["BeginDate", "CreationDate"],
+            kind="stable",
+            na_position="first",
+        )
+
     frame = frame.dropna(subset=["BeginDate", "LoadMw"])
     if frame.empty:
         raise CheaterForecastError("ISO-NE forecast rows contained no usable BeginDate/LoadMw data.")
 
-    hourly = (
-        frame.groupby("BeginDate", sort=True)["LoadMw"]
-        .last()
-        .sort_index()
-    )
+    hourly = frame.groupby("BeginDate", sort=True)["LoadMw"].last().sort_index()
     five_minute = hourly.resample("5min").interpolate(method="linear")
 
-    target_dt = to_datetime(target_timestamp).replace(second=0, microsecond=0)
+    target_dt = to_datetime(target_timestamp)
     target_index = pd.Timestamp(target_dt).tz_convert("UTC")
     if target_index not in five_minute.index:
         raise CheaterForecastError(
-            "Validator timestamp was outside the ISO-NE hourly forecast interpolation range."
+            "Validator timestamp is not on a 5-minute ISO-NE forecast interpolation slot."
         )
 
     prediction = five_minute.loc[target_index]
@@ -113,18 +116,15 @@ def _interpolate_five_minute_prediction(
 
 def predict_load_mw_for_timestamp(target_timestamp: str) -> float:
     """
-    Return the official ISO-NE hourly forecast interpolated to the validator timestamp.
+    Return ISO-NE hourly LoadMw interpolated exactly at the validator timestamp.
 
-    The validator sends timestamps six hours ahead on 5-minute boundaries. This
-    function uses that timestamp directly instead of recalculating the horizon.
+    This function does not calculate or replace timestamps. The validator request
+    timestamp is the single source of truth for the returned prediction.
     """
+    if not target_timestamp:
+        raise CheaterForecastError("Validator timestamp is required.")
     rows = _fetch_forecast_rows_around(target_timestamp)
     return _interpolate_five_minute_prediction(rows, target_timestamp)
-
-
-def validator_target_timestamp() -> str:
-    target_time = round_to_interval(get_now(), interval_minutes=5) + timedelta(hours=6)
-    return to_str(target_time)
 
 
 class CheaterHourlyForecastPredictor:
@@ -141,14 +141,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--timestamp",
-        default=None,
-        help="Validator timestamp to predict. Defaults to the repo validator's now+6h timestamp.",
+        required=True,
+        help="Validator timestamp to predict. The script never generates its own timestamp.",
     )
     args = parser.parse_args(argv)
 
-    timestamp = args.timestamp or validator_target_timestamp()
     try:
-        prediction = predict_load_mw_for_timestamp(timestamp)
+        prediction = predict_load_mw_for_timestamp(args.timestamp)
     except Exception as exc:
         print(f"Failed to retrieve ISO-NE hourly forecast: {exc}", file=sys.stderr)
         return 1

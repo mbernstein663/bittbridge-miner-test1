@@ -11,7 +11,7 @@ import bittbridge
 
 # import base miner class which takes care of most of the boilerplate
 from bittbridge.base.miner import BaseMinerNeuron
-from cheater import CheaterHourlyForecastPredictor
+from miner_model_energy.cheater import CheaterHourlyForecastPredictor
 from miner_model_energy.inference_runtime import (
     AdvancedModelPredictor,
     BaselineMovingAveragePredictor,
@@ -59,23 +59,39 @@ class PreflightExitRequested(Exception):
 
 
 def _cheater_model_enabled(model_params_path: str) -> bool:
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
     try:
         with open(model_params_path, "r", encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle) or {}
+            text = handle.read()
     except FileNotFoundError:
         return False
+
+    for line in text.splitlines():
+        clean = line.split("#", 1)[0].strip()
+        if not clean.startswith("cheater_model"):
+            continue
+        separator = ":" if ":" in clean else "=" if "=" in clean else None
+        if separator is None:
+            continue
+        key, value = clean.split(separator, 1)
+        if key.strip() == "cheater_model":
+            return _as_bool(value)
+
+    try:
+        raw = yaml.safe_load(text) or {}
     except Exception as exc:
         print(f"  Failed to inspect cheater_model toggle: {exc}")
         return False
 
     if not isinstance(raw, dict):
         return False
-    value = raw.get("cheater_model", False)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
+    return _as_bool(raw.get("cheater_model", False))
 
 
 def _section(title: str) -> None:
